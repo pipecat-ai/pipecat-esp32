@@ -58,9 +58,13 @@ static void pipecat_onconnectionstatechange_task(PeerConnectionState state,
 #endif
   } else if (state == PEER_CONNECTION_COMPLETED) {
 #ifndef LINUX_BUILD
+
+    ESP_LOGI(LOG_TAG, "Creating send audio task");
     // Todo: move this to a separate init block
     xTaskCreatePinnedToCore(pipecat_send_audio_task, "audio_publisher", 24576, NULL, 7, &xSendAudioTaskHandle, 0);
-    pipecat_init_rtvi(peer_connection, &pipecat_rtvi_callbacks);
+    heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
+    // pipecat_init_rtvi(peer_connection, &pipecat_rtvi_callbacks);
 #endif
   }
 }

@@ -23,14 +23,27 @@ extern "C" void app_main(void) {
   webrtcSemaphore = xSemaphoreCreateMutex();
 
   pipecat_init_screen();
-  peer_init();
-  pipecat_init_audio_capture();
-  pipecat_init_audio_decoder();
-  pipecat_init_wifi();
-  pipecat_init_webrtc();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
 
+  peer_init();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
+  pipecat_init_audio_capture();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
+  pipecat_init_audio_decoder();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
+  pipecat_init_wifi();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
+  pipecat_init_webrtc();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
+  ESP_LOGI(LOG_TAG, "Pipecat ESP32 client initialized");
   pipecat_screen_system_log("Pipecat ESP32 client initialized\n");
 
+  ESP_LOGI(LOG_TAG, "Starting webrtc task");
   pipecat_webrtc_run_task();
 
   while (1) {
