@@ -18,12 +18,14 @@ extern void pipecat_audio_decode(uint8_t *data, size_t size);
 // WebRTC / Signalling
 extern void pipecat_init_webrtc();
 extern void pipecat_webrtc_loop();
+extern void pipecat_webrtc_run_task();
 extern void pipecat_http_request(char *offer, char *answer);
 
 // RTVI
 typedef struct {
   void (*on_bot_started_speaking)();
   void (*on_bot_stopped_speaking)();
+
   void (*on_bot_tts_text)(const char *text);
 } rtvi_callbacks_t;
 
