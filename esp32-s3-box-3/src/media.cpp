@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstring>
 #include <esp_timer.h>
+#include <freertos/ringbuf.h>
 
 #include "esp_log.h"
 #include "main.h"
@@ -59,6 +60,10 @@ void pipecat_init_audio_capture() {
 opus_int16 *decoder_buffer = NULL;
 OpusDecoder *opus_decoder = NULL;
 
+// Ring buffer for speaker reference data (declare before use)
+static RingbufHandle_t speaker_ringbuf = NULL;
+static const size_t SPEAKER_RINGBUF_SIZE = 8192;  // ~3.2 read cycles at 1280 samples/read
+
 void pipecat_init_audio_decoder() {
   int decoder_error = 0;
   opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &decoder_error);
@@ -77,10 +82,34 @@ void pipecat_audio_decode(uint8_t *data, size_t size) {
 
   if (decoded_size > 0) {
     set_is_playing(decoder_buffer, decoded_size);
+    
+    // Send to speaker
     if ((ret = esp_codec_dev_write(spk_codec_dev, decoder_buffer,
                                    decoded_size * sizeof(uint16_t))) !=
         ESP_OK) {
       ESP_LOGE(LOG_TAG, "esp_codec_dev_write failed: %s", esp_err_to_name(ret));
+    }
+    
+    // Also send to ring buffer for AEC reference
+    if (speaker_ringbuf != NULL) {
+      BaseType_t ret = xRingbufferSend(speaker_ringbuf, decoder_buffer, 
+                                       decoded_size * sizeof(int16_t), 0);
+      if (ret != pdTRUE) {
+        // Ring buffer full, this is expected occasionally
+        static int overflow_count = 0;
+        if (++overflow_count % 100 == 0) {
+          ESP_LOGW(LOG_TAG, "Speaker ring buffer overflow count: %d", overflow_count);
+        }
+      } else {
+        // Log successful writes occasionally
+        static int write_count = 0;
+        if (++write_count % 50 == 0) {
+          ESP_LOGI(LOG_TAG, "Speaker ring buffer writes: %d, size: %d bytes", 
+                   write_count, decoded_size * sizeof(int16_t));
+        }
+      }
+    } else {
+      ESP_LOGW(LOG_TAG, "Speaker ring buffer is NULL!");
     }
   }
 }
@@ -146,6 +175,14 @@ void pipecat_init_aec() {
   // Try a simpler approach - create AEC without the task configuration struct
   ESP_LOGI(LOG_TAG, "Initializing AEC with simple configuration");
   
+  // Create ring buffer for speaker reference data
+  speaker_ringbuf = xRingbufferCreate(SPEAKER_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
+  if (speaker_ringbuf == NULL) {
+    ESP_LOGE(LOG_TAG, "Failed to create speaker ring buffer");
+    return;
+  }
+  ESP_LOGI(LOG_TAG, "Speaker ring buffer created, size=%d", SPEAKER_RINGBUF_SIZE);
+  
   // Create AEC with basic parameters (filter_length=4 recommended for ESP32S3)
   aec_handle = afe_aec_create("MR", 4, AFE_TYPE_VC, AFE_MODE_LOW_COST);
   if (aec_handle == NULL) {
@@ -203,9 +240,10 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   end_time = esp_timer_get_time();
   total_read_time += (end_time - start_time);
 
-  if (is_playing) {
-    memset(read_buffer, 0, PCM_BUFFER_SIZE);
-  }
+  // Don't zero out microphone input - let AEC handle echo cancellation
+  // if (is_playing) {
+  //   memset(read_buffer, 0, PCM_BUFFER_SIZE);
+  // }
 
   // AEC processing (skip if disabled)
   if (aec_handle != NULL) {
@@ -236,10 +274,50 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
       // Prepare input: interleave mic data with zeros (reference channel)
       int16_t *mic_ptr = (int16_t *)read_buffer + (chunk * aec_chunk_size);
       
-      // Format: MRMRMR... (interleaved - mic and ref alternating)
-      for (int i = 0; i < aec_chunk_size; i++) {
-        aec_in_buffer[i * 2] = mic_ptr[i];      // Microphone channel
-        aec_in_buffer[i * 2 + 1] = 0;           // Reference channel (zeros for now)
+      // Get reference data from speaker ring buffer
+      size_t ref_bytes_needed = aec_chunk_size * sizeof(int16_t);
+      size_t ref_bytes_available = 0;
+      int16_t *ref_data = NULL;
+      
+      if (speaker_ringbuf != NULL) {
+        ref_data = (int16_t *)xRingbufferReceive(speaker_ringbuf, &ref_bytes_available, 0);
+      } else {
+        static bool logged_null = false;
+        if (!logged_null) {
+          ESP_LOGW(LOG_TAG, "Speaker ring buffer is NULL during read!");
+          logged_null = true;
+        }
+      }
+      
+      if (ref_data != NULL && ref_bytes_available >= ref_bytes_needed) {
+        // Use actual speaker reference data
+        for (int i = 0; i < aec_chunk_size; i++) {
+          aec_in_buffer[i * 2] = mic_ptr[i];      // Microphone channel
+          aec_in_buffer[i * 2 + 1] = ref_data[i]; // Reference channel (actual speaker data)
+        }
+        // Return item to ring buffer
+        vRingbufferReturnItem(speaker_ringbuf, ref_data);
+        
+        // Log successful reads occasionally
+        static int ref_success_count = 0;
+        if (++ref_success_count % 50 == 0) {
+          ESP_LOGI(LOG_TAG, "Using speaker reference data, count: %d, bytes: %d", 
+                   ref_success_count, ref_bytes_available);
+        }
+      } else {
+        // No reference data available, use zeros
+        for (int i = 0; i < aec_chunk_size; i++) {
+          aec_in_buffer[i * 2] = mic_ptr[i];      // Microphone channel  
+          aec_in_buffer[i * 2 + 1] = 0;           // Reference channel (zeros as fallback)
+        }
+        if (ref_data != NULL) {
+          vRingbufferReturnItem(speaker_ringbuf, ref_data);
+        }
+        // Log when we don't have reference data (only occasionally to avoid spam)
+        static int no_ref_count = 0;
+        if (++no_ref_count % 100 == 0) {
+          ESP_LOGW(LOG_TAG, "No speaker reference data available count: %d", no_ref_count);
+        }
       }
       
       // Run AEC process for this chunk
