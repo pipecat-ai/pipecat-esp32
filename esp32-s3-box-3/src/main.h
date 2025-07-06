@@ -14,6 +14,7 @@ extern void pipecat_init_audio_decoder();
 extern void pipecat_init_audio_encoder();
 extern void pipecat_send_audio(PeerConnection *peer_connection);
 extern void pipecat_audio_decode(uint8_t *data, size_t size);
+extern void pipecat_init_aec();
 
 // WebRTC / Signalling
 extern void pipecat_init_webrtc();

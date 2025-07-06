@@ -25,7 +25,7 @@ endif()
 add_compile_definitions(PIPECAT_SMALLWEBRTC_URL="$ENV{PIPECAT_SMALLWEBRTC_URL}")
 
 set(COMPONENTS src)
-set(EXTRA_COMPONENT_DIRS "src" "components/srtp" "components/peer" "components/esp-libopus")
+set(EXTRA_COMPONENT_DIRS "src" "components/srtp" "components/peer" "components/esp-libopus" "esp-adf/components")
 
 if(IDF_TARGET STREQUAL linux)
   add_compile_definitions(LINUX_BUILD=1)

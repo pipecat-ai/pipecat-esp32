@@ -34,6 +34,9 @@ extern "C" void app_main(void) {
   pipecat_init_audio_decoder();
   heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
 
+  pipecat_init_aec();
+  heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
   pipecat_init_wifi();
   heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
 

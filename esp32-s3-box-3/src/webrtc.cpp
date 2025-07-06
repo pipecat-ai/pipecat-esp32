@@ -23,7 +23,7 @@ void pipecat_send_audio_task(void *user_data) {
 
   while (1) {
     pipecat_send_audio(peer_connection);
-    vTaskDelay(pdMS_TO_TICKS(TICK_INTERVAL));
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 #endif
@@ -61,10 +61,11 @@ static void pipecat_onconnectionstatechange_task(PeerConnectionState state,
 
     ESP_LOGI(LOG_TAG, "Creating send audio task");
     // Todo: move this to a separate init block
-    xTaskCreatePinnedToCore(pipecat_send_audio_task, "audio_publisher", 24576, NULL, 7, &xSendAudioTaskHandle, 0);
+    // Why is this stack size so large? Opus encoder?
+    xTaskCreatePinnedToCore(pipecat_send_audio_task, "audio_publisher", 24576, NULL, 7, &xSendAudioTaskHandle, 1);
     heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
 
-    // pipecat_init_rtvi(peer_connection, &pipecat_rtvi_callbacks);
+    pipecat_init_rtvi(peer_connection, &pipecat_rtvi_callbacks);
 #endif
   }
 }
@@ -139,5 +140,5 @@ void peer_connection_task(void* arg) {
 void pipecat_webrtc_run_task() {
   ESP_LOGI(LOG_TAG, "peer_connection_task starting ...");
 
-  xTaskCreatePinnedToCore(peer_connection_task, "peer_connection", 16384, NULL, 5, &xPcTaskHandle, 1);
+  xTaskCreatePinnedToCore(peer_connection_task, "peer_connection", 16384, NULL, 5, &xPcTaskHandle, 0);
 }
