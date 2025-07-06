@@ -7,6 +7,11 @@ if(NOT IDF_TARGET STREQUAL linux)
 
   add_compile_definitions(WIFI_SSID="$ENV{WIFI_SSID}")
   add_compile_definitions(WIFI_PASSWORD="$ENV{WIFI_PASSWORD}")
+
+  # We are not using video in this app, so set the max NALU size to very small
+  if(NOT DEFINED ENV{CONFIG_MAX_NALU_SIZE})
+    add_compile_definitions(CONFIG_MAX_NALU_SIZE=32)
+  endif()
 endif()
 
 if(NOT DEFINED ENV{PIPECAT_SMALLWEBRTC_URL})
