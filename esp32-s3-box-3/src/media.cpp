@@ -72,17 +72,15 @@ OpusDecoder *opus_decoder = NULL;
 
 // Circular buffer for speaker reference data (not using FreeRTOS ring buffer)
 static int16_t* speaker_circular_buffer = NULL;
-static const size_t SPEAKER_BUFFER_SAMPLES = 4096;  // 4096 samples = 8192 bytes
-static const size_t MIN_REF_BUFFER_SAMPLES = 2560;  // 2 read cycles worth to prevent underruns
+static const size_t SPEAKER_BUFFER_SAMPLES = 4096;  // 4096 samples = 256ms @ 16kHz
+static const size_t MIN_REF_BUFFER_SAMPLES = 2560;  // 2 read cycles worth (160ms)
+static const size_t MIN_REF_BUFFER_RESUME = 1920;   // 1.5 cycles for recovery (120ms)
 static volatile size_t speaker_write_idx = 0;
 static volatile size_t speaker_read_idx = 0;
 static volatile size_t speaker_samples_available = 0;
 static portMUX_TYPE speaker_buffer_mutex = portMUX_INITIALIZER_UNLOCKED;
 
-// AEC reference delay compensation (in samples)
-// This accounts for acoustic path + hardware delays
-// Typical value: 320 samples = 20ms at 16kHz
-static const size_t AEC_REF_DELAY_SAMPLES = 320;
+// AEC reference delay compensation removed - assuming AEC implementation handles delay internally
 // ref_buffer_primed already declared above for use in set_is_playing
 
 void pipecat_init_audio_decoder() {
@@ -215,27 +213,13 @@ void pipecat_init_audio_encoder() {
   processed_buffer = (int16_t *)heap_caps_malloc(PCM_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
 }
 
-
-typedef struct {
-  int        task_stack;     /*!< Task stack size */
-  int        task_prio;      /*!< Task peroid */
-  int        task_core;      /*!< The core that task to be created */
-  bool       debug_aec;      /*!< debug AEC input data */
-  bool       stack_in_ext;   /*!< Try to allocate stack in external memory */
-  afe_type_t type;           /*!< The type of afe， AFE_TYPE_SR , AFE_TYPE_VC , AFE_TYPE_VC_8K */
-  afe_mode_t mode;           /*!< The mode of afe， AFE_MODE_LOW_COST or AFE_MODE_HIGH_PERF */
-  int        filter_length;  /*!< The filter length of aec */
-  char      *input_format;   /*!< The input format is as follows: For example, 'MR', 'RMNM'.
-                                  'M' means data from microphone, 'R' means data from reference data, 'N' means no data.. */
-} aec_stream_cfg_t;
-
 static int16_t *aec_in_buffer = NULL;
 static int16_t *aec_out_buffer = NULL;
 static afe_aec_handle_t *aec_handle = NULL;
 
 void pipecat_init_aec() {
   // Try a simpler approach - create AEC without the task configuration struct
-  ESP_LOGI(LOG_TAG, "Initializing AEC with simple configuration");
+  ESP_LOGI(LOG_TAG, "Initializing AEC");
   
   // Create circular buffer for speaker reference data
   speaker_circular_buffer = (int16_t *)heap_caps_malloc(SPEAKER_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -308,7 +292,7 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   // }
 
   // AEC processing (skip if disabled)
-  if (aec_handle != NULL) {
+  if (aec_handle != NULL && aec_enabled) {
     // Get AEC chunk size (should be 256 samples for 16kHz)
     int aec_chunk_size = afe_aec_get_chunksize(aec_handle);
     int total_samples = PCM_BUFFER_SIZE / sizeof(uint16_t);  // 640 samples
@@ -358,22 +342,47 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
           samples_for_log = speaker_samples_available;
         }
         
+        // Warn if we're getting close to the unprime threshold
+        static int low_buffer_count = 0;
+        if (speaker_samples_available < 2200 && speaker_samples_available >= 1920) {
+          if (++low_buffer_count % 10 == 0) {
+            ESP_LOGW(LOG_TAG, "Buffer running low: %d samples (unprime at 1920)", speaker_samples_available);
+          }
+        } else {
+          low_buffer_count = 0;
+        }
+        
         // Only start using reference data if we have enough buffered
-        // We need MIN_REF_BUFFER_SAMPLES + delay compensation
-        size_t required_samples = MIN_REF_BUFFER_SAMPLES + AEC_REF_DELAY_SAMPLES;
-        if (!ref_buffer_primed && speaker_samples_available >= required_samples) {
-          ref_buffer_primed = true;
-          log_primed = true;
-          samples_for_log = speaker_samples_available;
+        // Use hysteresis to prevent oscillation
+        if (!ref_buffer_primed) {
+          size_t required_samples = in_recovery_mode ? MIN_REF_BUFFER_RESUME : MIN_REF_BUFFER_SAMPLES;
+          if (speaker_samples_available >= required_samples) {
+            ref_buffer_primed = true;
+            log_primed = true;
+            samples_for_log = speaker_samples_available;
+          }
+        }
+        
+        // Recovery check: if we've been unprimed for too long, reduce requirements
+        static int unprime_count = 0;
+        static bool in_recovery_mode = false;
+        
+        if (!ref_buffer_primed) {
+          unprime_count++;
+          // After 25 attempts (~2 seconds), enter recovery mode
+          if (unprime_count > 25 && !in_recovery_mode) {
+            in_recovery_mode = true;
+            ESP_LOGW(LOG_TAG, "Entering recovery mode after %d attempts", unprime_count);
+          }
+        } else {
+          unprime_count = 0;
         }
         
         // Only try to get reference data if buffer is primed
         if (ref_buffer_primed) {
-          // Check if we have enough samples for this chunk plus delay
-          if (speaker_samples_available >= aec_chunk_size + AEC_REF_DELAY_SAMPLES) {
+          // Check if we have enough samples for this chunk
+          if (speaker_samples_available >= aec_chunk_size) {
             // Read samples from circular buffer
-            // The delay is maintained by keeping a fixed distance between write and read pointers
-            // speaker_samples_available should always be >= AEC_REF_DELAY_SAMPLES + needed samples
             for (int i = 0; i < aec_chunk_size; i++) {
               ref_chunk[i] = speaker_circular_buffer[speaker_read_idx];
               speaker_read_idx = (speaker_read_idx + 1) % SPEAKER_BUFFER_SAMPLES;
@@ -382,15 +391,33 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
             have_ref_data = true;
             
             // Check if we're running too low for remaining chunks
-            // We need to maintain AEC_REF_DELAY_SAMPLES delay plus samples for remaining chunks
             int remaining_chunks = num_chunks - chunk - 1;
-            size_t remaining_samples_needed = remaining_chunks * aec_chunk_size + AEC_REF_DELAY_SAMPLES;
-            if (speaker_samples_available < remaining_samples_needed) {
-              ref_buffer_primed = false;
-              log_underrun = true;
-              underrun_type = 1;
-              samples_for_log = speaker_samples_available;
-              needed_for_log = remaining_samples_needed;
+            size_t remaining_samples_needed = remaining_chunks * aec_chunk_size;
+            
+            // In recovery mode, be more lenient - only unprime if we can't process ANY more chunks
+            if (in_recovery_mode) {
+              if (speaker_samples_available < aec_chunk_size) {
+                ref_buffer_primed = false;
+                log_underrun = true;
+                underrun_type = 1;
+                samples_for_log = speaker_samples_available;
+                needed_for_log = aec_chunk_size;
+              } else if (speaker_samples_available >= MIN_REF_BUFFER_SAMPLES) {
+                // Exit recovery mode once buffer is fully healthy
+                in_recovery_mode = false;
+                ESP_LOGI(LOG_TAG, "Exiting recovery mode, buffer healthy with %d samples", speaker_samples_available);
+              }
+            } else {
+              // Normal mode - only unprime if we drop below a lower threshold
+              // This provides hysteresis to prevent oscillation
+              if (speaker_samples_available < 1920) {  // 1.5 cycles = 120ms
+                ref_buffer_primed = false;
+                log_underrun = true;
+                underrun_type = 1;
+                samples_for_log = speaker_samples_available;
+                needed_for_log = remaining_samples_needed;
+                ESP_LOGW(LOG_TAG, "Unpriming: dropped below 1920 samples (have %d)", speaker_samples_available);
+              }
             }
           } else {
             // Not enough samples, unprime
@@ -439,7 +466,8 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
         // Log successful reads occasionally
         static int ref_success_count = 0;
         if (++ref_success_count % 50 == 0) {
-          ESP_LOGI(LOG_TAG, "Using speaker reference data, count: %d", ref_success_count);
+          ESP_LOGI(LOG_TAG, "Using speaker reference data, count: %d, buffer: %d samples", 
+                   ref_success_count, speaker_samples_available);
         }
       } else {
         // No reference data available, use zeros
