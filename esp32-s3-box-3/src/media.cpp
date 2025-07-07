@@ -78,6 +78,11 @@ static volatile size_t speaker_write_idx = 0;
 static volatile size_t speaker_read_idx = 0;
 static volatile size_t speaker_samples_available = 0;
 static portMUX_TYPE speaker_buffer_mutex = portMUX_INITIALIZER_UNLOCKED;
+
+// AEC reference delay compensation (in samples)
+// This accounts for acoustic path + hardware delays
+// Typical value: 320 samples = 20ms at 16kHz
+static const size_t AEC_REF_DELAY_SAMPLES = 320;
 // ref_buffer_primed already declared above for use in set_is_playing
 
 void pipecat_init_audio_decoder() {
@@ -354,7 +359,9 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
         }
         
         // Only start using reference data if we have enough buffered
-        if (!ref_buffer_primed && speaker_samples_available >= MIN_REF_BUFFER_SAMPLES) {
+        // We need MIN_REF_BUFFER_SAMPLES + delay compensation
+        size_t required_samples = MIN_REF_BUFFER_SAMPLES + AEC_REF_DELAY_SAMPLES;
+        if (!ref_buffer_primed && speaker_samples_available >= required_samples) {
           ref_buffer_primed = true;
           log_primed = true;
           samples_for_log = speaker_samples_available;
@@ -362,9 +369,11 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
         
         // Only try to get reference data if buffer is primed
         if (ref_buffer_primed) {
-          // Check if we have enough samples for this chunk
-          if (speaker_samples_available >= aec_chunk_size) {
+          // Check if we have enough samples for this chunk plus delay
+          if (speaker_samples_available >= aec_chunk_size + AEC_REF_DELAY_SAMPLES) {
             // Read samples from circular buffer
+            // The delay is maintained by keeping a fixed distance between write and read pointers
+            // speaker_samples_available should always be >= AEC_REF_DELAY_SAMPLES + needed samples
             for (int i = 0; i < aec_chunk_size; i++) {
               ref_chunk[i] = speaker_circular_buffer[speaker_read_idx];
               speaker_read_idx = (speaker_read_idx + 1) % SPEAKER_BUFFER_SAMPLES;
@@ -373,8 +382,9 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
             have_ref_data = true;
             
             // Check if we're running too low for remaining chunks
+            // We need to maintain AEC_REF_DELAY_SAMPLES delay plus samples for remaining chunks
             int remaining_chunks = num_chunks - chunk - 1;
-            size_t remaining_samples_needed = remaining_chunks * aec_chunk_size;
+            size_t remaining_samples_needed = remaining_chunks * aec_chunk_size + AEC_REF_DELAY_SAMPLES;
             if (speaker_samples_available < remaining_samples_needed) {
               ref_buffer_primed = false;
               log_underrun = true;
