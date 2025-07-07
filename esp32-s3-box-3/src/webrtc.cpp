@@ -5,6 +5,7 @@
 
 #include <esp_event.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <string.h>
 
 #include "main.h"
@@ -22,8 +23,19 @@ void pipecat_send_audio_task(void *user_data) {
   pipecat_init_audio_encoder();
 
   while (1) {
+    uint64_t start_time = esp_timer_get_time();
     pipecat_send_audio(peer_connection);
-    vTaskDelay(pdMS_TO_TICKS(1));
+    uint64_t end_time = esp_timer_get_time();
+    uint64_t elapsed_ms = (end_time - start_time) / 1000;
+    
+    // We process 1280 samples at 16kHz = 80ms of audio
+    // Delay for the remainder of the 80ms period
+    if (elapsed_ms < 80) {
+      vTaskDelay(pdMS_TO_TICKS(80 - elapsed_ms));
+    } else {
+      // If processing took longer than 80ms, yield to other tasks
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
   }
 }
 #endif
