@@ -57,8 +57,10 @@ OpusDecoder *opus_decoder = NULL;
 static int16_t speaker_circular_buffer[640];   // Exactly 2 Opus frames (40ms @ 16kHz)
 static volatile size_t speaker_write_idx = 0;
 static volatile size_t speaker_read_idx = 0;
+static volatile size_t speaker_buffer_count = 0;  // Number of samples in buffer
 static volatile bool speaker_buffer_active = false; // True when we're receiving audio
 static portMUX_TYPE speaker_buffer_mutex = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint64_t last_buffer_read_time = 0;  // Track when buffer was last read
 
 // Function to update playback state and reset buffer when playback stops
 void set_is_playing(int16_t *in_buf, size_t in_samples) {
@@ -76,6 +78,8 @@ void set_is_playing(int16_t *in_buf, size_t in_samples) {
     portENTER_CRITICAL(&speaker_buffer_mutex);
     speaker_buffer_active = false;
     speaker_read_idx = speaker_write_idx; // Reset read to match write
+    speaker_buffer_count = 0;
+    last_buffer_read_time = 0;  // Reset read time
     portEXIT_CRITICAL(&speaker_buffer_mutex);
     ESP_LOGD(LOG_TAG, "Playback stopped, reset speaker buffer");
   }
@@ -99,51 +103,83 @@ void pipecat_audio_decode(uint8_t *data, size_t size) {
   if (last_decode_time > 0) {
     uint64_t delta_ms = (now - last_decode_time) / 1000;
     static int packet_count = 0;
-    if (++packet_count % 10 == 0) {
-      ESP_LOGI(LOG_TAG, "Audio packet %d: size=%d, delta=%llu ms", packet_count, size, delta_ms);
+    packet_count++;
+    
+    // Log every packet for first 20, then every 10th
+    if (packet_count <= 20 || packet_count % 10 == 0) {
+      // Get current buffer state for correlation
+      size_t current_write_idx, current_read_idx, current_count;
+      portENTER_CRITICAL(&speaker_buffer_mutex);
+      current_write_idx = speaker_write_idx;
+      current_read_idx = speaker_read_idx;
+      current_count = speaker_buffer_count;
+      portEXIT_CRITICAL(&speaker_buffer_mutex);
+      
+      ESP_LOGI(LOG_TAG, "[ARRIVAL] pkt#%d: size=%d, delta=%llums, buffer=%d samples, w=%d r=%d", 
+               packet_count, size, delta_ms, current_count, current_write_idx, current_read_idx);
     }
   }
   last_decode_time = now;
   
-  esp_err_t ret;
-  int decoded_size =
-      opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
+  // Decode Opus frame to get the size (or use fixed size if predictable)
+  int decoded_size = opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
 
   if (decoded_size > 0) {
+    // FIRST: Write to circular buffer for AEC reference (before any other processing)
+    portENTER_CRITICAL(&speaker_buffer_mutex);
+      
+      // Write to circular buffer
+      size_t space_available = 640 - speaker_buffer_count;
+      size_t samples_to_write = decoded_size;
+      
+      // If we don't have enough space, drop oldest samples
+      if (samples_to_write > space_available) {
+        size_t samples_to_drop = samples_to_write - space_available;
+        speaker_read_idx = (speaker_read_idx + samples_to_drop) % 640;
+        speaker_buffer_count -= samples_to_drop;
+      }
+      
+      // Write new samples
+      for (int i = 0; i < samples_to_write; i++) {
+        speaker_circular_buffer[speaker_write_idx] = decoder_buffer[i];
+        speaker_write_idx = (speaker_write_idx + 1) % 640;
+      }
+      speaker_buffer_count += samples_to_write;
+      speaker_buffer_active = true;
+      
+      // Get samples in buffer after write (while still in critical section)
+      size_t samples_in_buffer = speaker_buffer_count;
+      
+      portEXIT_CRITICAL(&speaker_buffer_mutex);
+      
+      // Log timing relative to last read from this buffer
+      uint64_t time_since_last_read = 0;
+      if (last_buffer_read_time > 0 && now > last_buffer_read_time) {
+        time_since_last_read = (now - last_buffer_read_time) / 1000;
+      } else {
+        time_since_last_read = 0;  // First write or invalid timestamp
+      }
+      
+      // More frequent logging for debugging
+      static int write_count = 0;
+      write_count++;
+      if (write_count <= 20 || write_count % 10 == 0) {
+        // Log the actual count, not calculated value
+        ESP_LOGI(LOG_TAG, "[WRITE] cnt=%d: +%d samples, buffer=%d, since_read=%llums (w=%d r=%d)", 
+                 write_count, decoded_size, samples_in_buffer, time_since_last_read,
+                 speaker_write_idx, speaker_read_idx);
+      }
+    
+    // THEN: Process for playback
     set_is_playing(decoder_buffer, decoded_size);
     
     // Send to speaker
+    esp_err_t ret;
     if ((ret = esp_codec_dev_write(spk_codec_dev, decoder_buffer,
                                    decoded_size * sizeof(uint16_t))) !=
         ESP_OK) {
       ESP_LOGE(LOG_TAG, "esp_codec_dev_write failed: %s", esp_err_to_name(ret));
     }
-    
-    // Also send to circular buffer for AEC reference
-    portENTER_CRITICAL(&speaker_buffer_mutex);
-      
-      // Write to circular buffer, always keeping just the freshest 2 frames
-      for (int i = 0; i < decoded_size; i++) {
-        speaker_circular_buffer[speaker_write_idx] = decoder_buffer[i];
-        speaker_write_idx = (speaker_write_idx + 1) % 640;
-      }
-      speaker_buffer_active = true;
-      
-      // If read pointer is too far behind, advance it to stay within 2 frames
-      size_t distance = (speaker_write_idx - speaker_read_idx + 640) % 640;
-      if (distance > 640 - 320) {
-        // Read pointer is about to be overrun, advance it
-        speaker_read_idx = (speaker_write_idx + 640 - 320) % 640;
-      }
-      
-      portEXIT_CRITICAL(&speaker_buffer_mutex);
-      
-      // Occasional logging
-      static int write_count = 0;
-      if (++write_count % 50 == 0) {
-        ESP_LOGI(LOG_TAG, "Speaker buffer: write_idx=%d, read_idx=%d", 
-                 speaker_write_idx, speaker_read_idx);
-      }
   }
 }
 
@@ -241,18 +277,25 @@ void pipecat_init_aec() {
 void pipecat_send_audio(PeerConnection *peer_connection) {
   uint64_t start_time, end_time;
   
-  // Wait for at least one Opus frame (320 samples) of speaker data
+  // Wait for (640 samples = 2 Opus frames) in our speaker data reference buffer to handle codec burst pattern
   uint64_t wait_start = esp_timer_get_time();
+  int initial_samples = 0;
+  int wait_iterations = 0;
   while (true) {
     portENTER_CRITICAL(&speaker_buffer_mutex);
     int samples_available = 0;
     if (speaker_buffer_active) {
-      samples_available = (speaker_write_idx - speaker_read_idx + 640) % 640;
+      samples_available = speaker_buffer_count;
     }
     portEXIT_CRITICAL(&speaker_buffer_mutex);
     
-    if (samples_available >= 320) {
-      break;  // We have enough data
+    wait_iterations++;
+    if (initial_samples == 0) {
+      initial_samples = samples_available;
+    }
+    
+    if (samples_available >= 640) {
+      break;  // Buffer is full - ready to handle burst consumption
     }
     
     // Brief delay before checking again
@@ -260,6 +303,21 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   }
   uint64_t wait_end = esp_timer_get_time();
   total_wait_time += (wait_end - wait_start);
+  
+  // Log initial buffer state
+  static int call_count = 0;
+  call_count++;
+  // Get consistent snapshot of buffer state
+  size_t log_write_idx, log_read_idx, log_count;
+  portENTER_CRITICAL(&speaker_buffer_mutex);
+  log_write_idx = speaker_write_idx;
+  log_read_idx = speaker_read_idx;
+  log_count = speaker_buffer_count;
+  portEXIT_CRITICAL(&speaker_buffer_mutex);
+  
+  ESP_LOGI(LOG_TAG, "[SEND_START] call#%d: initial=%d, wait=%lluus, iters=%d, count=%d, w=%d r=%d", 
+           call_count, initial_samples, wait_end - wait_start, wait_iterations,
+           log_count, log_write_idx, log_read_idx);
   
   // Buffers for interleaved processing
   static int16_t opus_accumulator[640];  // Accumulate AEC output for Opus encoding
@@ -271,9 +329,26 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   bool skip_last_aec = false;
   int frame_count = 0;
   
+  // Track timing - each read blocks for ~16ms (256 samples @ 16kHz)
+  uint64_t loop_start_time = esp_timer_get_time();
+  
   // Single loop processing 5 chunks of 256 samples each
   for (int chunk = 0; chunk < 5; chunk++) {
+    uint64_t chunk_start_time = esp_timer_get_time();
     // 1. Read 256 samples from microphone
+    // Log buffer state before read (for chunk 0 and 1)
+    if (chunk <= 1) {
+      size_t pre_read_write_idx, pre_read_read_idx, pre_read_count;
+      portENTER_CRITICAL(&speaker_buffer_mutex);
+      pre_read_write_idx = speaker_write_idx;
+      pre_read_read_idx = speaker_read_idx;
+      pre_read_count = speaker_buffer_count;
+      portEXIT_CRITICAL(&speaker_buffer_mutex);
+      
+      ESP_LOGI(LOG_TAG, "[PRE_READ] chunk=%d: buffer has %d samples (w=%d r=%d)", 
+               chunk, pre_read_count, pre_read_write_idx, pre_read_read_idx);
+    }
+    
     start_time = esp_timer_get_time();
     if (esp_codec_dev_read(mic_codec_dev, (uint8_t*)mic_chunk_buffer, 256 * sizeof(int16_t)) != ESP_OK) {
       ESP_LOGE(LOG_TAG, "esp_codec_dev_read failed");
@@ -281,6 +356,12 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
     }
     end_time = esp_timer_get_time();
     total_read_time += (end_time - start_time);
+    
+    // Log if a long read happened (indicating actual blocking)
+    uint64_t read_duration = (end_time - start_time) / 1000;
+    if (read_duration > 10) {  // More than 10ms suggests actual blocking
+      ESP_LOGI(LOG_TAG, "[BLOCKED_READ] chunk=%d: read took %llums", chunk, read_duration);
+    }
     
     // 2. Process with AEC or bypass
     if (aec_handle != NULL && aec_enabled && !(chunk == 4 && skip_last_aec)) {
@@ -294,7 +375,7 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
       portENTER_CRITICAL(&speaker_buffer_mutex);
         
         if (speaker_buffer_active) {
-          samples_available = (speaker_write_idx - speaker_read_idx + 640) % 640;
+          samples_available = speaker_buffer_count;
           
           if (samples_available >= aec_chunk_size) {
             // We have enough data, read it
@@ -302,6 +383,7 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
               ref_chunk[i] = speaker_circular_buffer[speaker_read_idx];
               speaker_read_idx = (speaker_read_idx + 1) % 640;
             }
+            speaker_buffer_count -= aec_chunk_size;
           } else if (samples_available > 0) {
             // Not enough data, read what we have and pad with zeros
             int i;
@@ -309,11 +391,14 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
               ref_chunk[i] = speaker_circular_buffer[speaker_read_idx];
               speaker_read_idx = (speaker_read_idx + 1) % 640;
             }
+            speaker_buffer_count = 0;  // We consumed all available samples
             for (; i < aec_chunk_size; i++) {
               ref_chunk[i] = 0;
             }
             
-            if (++underrun_count % 10 == 0) {
+            underrun_count++;
+            // Log every underrun for first 20, then every 10th
+            if (underrun_count <= 20 || underrun_count % 10 == 0) {
               log_underrun = true;
             }
           } else {
@@ -322,7 +407,9 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
               ref_chunk[i] = 0;
             }
             
-            if (++underrun_count % 10 == 0) {
+            underrun_count++;
+            // Log every underrun for first 20, then every 10th
+            if (underrun_count <= 20 || underrun_count % 10 == 0) {
               log_underrun = true;
             }
           }
@@ -335,9 +422,28 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
         
         portEXIT_CRITICAL(&speaker_buffer_mutex);
         
+        // Update last read time if we read any data
+        // Update last read time if we successfully read data
+        if (speaker_buffer_active && samples_available >= aec_chunk_size) {
+          last_buffer_read_time = esp_timer_get_time();
+        } else if (speaker_buffer_active && samples_available > 0) {
+          // Even partial reads update the time
+          last_buffer_read_time = esp_timer_get_time();
+        }
+        
         if (log_underrun) {
-          ESP_LOGW(LOG_TAG, "Speaker buffer underrun: only %d/%d samples available", 
-                   samples_available, aec_chunk_size);
+          uint64_t time_since_loop_start = (esp_timer_get_time() - loop_start_time) / 1000;
+          // Get consistent state outside critical section
+          size_t log_w_idx, log_r_idx, log_cnt;
+          portENTER_CRITICAL(&speaker_buffer_mutex);
+          log_w_idx = speaker_write_idx;
+          log_r_idx = speaker_read_idx;
+          log_cnt = speaker_buffer_count;
+          portEXIT_CRITICAL(&speaker_buffer_mutex);
+          
+          ESP_LOGW(LOG_TAG, "[UNDERRUN] #%d: chunk=%d, only %d/%d samples, %llums since loop start, count=%d, w=%d r=%d", 
+                   underrun_count, chunk, samples_available, aec_chunk_size, 
+                   time_since_loop_start, log_cnt, log_w_idx, log_r_idx);
         }
       
       // Create interleaved AEC input
@@ -346,24 +452,32 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
         aec_in_buffer[i * 2 + 1] = ref_chunk[i];        // Reference
       }
       
-      // Run AEC
-      start_time = esp_timer_get_time();
-      int ret = afe_aec_process(aec_handle, aec_in_buffer, aec_out_buffer);
-      end_time = esp_timer_get_time();
-      total_aec_time += (end_time - start_time);
+      // Temporarily disabled AEC
+      // ----
+      // // Run AEC
+      // start_time = esp_timer_get_time();
+      // int ret = afe_aec_process(aec_handle, aec_in_buffer, aec_out_buffer);
+      // end_time = esp_timer_get_time();
+      // total_aec_time += (end_time - start_time);
       
-      if (ret < 0) {
-        ESP_LOGE(LOG_TAG, "afe_aec_process failed: return value %d", ret);
-        // Fall back - copy mic input directly
-        memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
-      } else {
-        // Copy AEC output to accumulator
-        memcpy(opus_accumulator + opus_accumulator_pos, aec_out_buffer, 256 * sizeof(int16_t));
-      }
+      // if (ret < 0) {
+      //   ESP_LOGE(LOG_TAG, "afe_aec_process failed: return value %d", ret);
+      //   // Fall back - copy mic input directly
+      //   memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
+      // } else {
+      //   // Copy AEC output to accumulator
+      //   memcpy(opus_accumulator + opus_accumulator_pos, aec_out_buffer, 256 * sizeof(int16_t));
+      // }
+      // ---- 
+      // Just copy mic data
+      memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
       
-      // Log successful AEC processing occasionally
-      if (++ref_success_count % 50 == 0) {
-        ESP_LOGI(LOG_TAG, "Using speaker reference data, count: %d", ref_success_count);
+      // Log successful reads more frequently for debugging
+      ref_success_count++;
+      if (ref_success_count <= 10 || ref_success_count % 20 == 0) {
+        uint64_t chunk_duration = (esp_timer_get_time() - chunk_start_time) / 1000;
+        ESP_LOGI(LOG_TAG, "[READ_OK] chunk=%d, got %d samples, chunk took %llums", 
+                 chunk, aec_chunk_size, chunk_duration);
       }
     } else {
       // AEC disabled or skipped - copy mic input directly
@@ -378,6 +492,8 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
     }
     
     opus_accumulator_pos += 256;
+    
+    // Note: esp_codec_dev_read blocks, providing natural pacing
     
     // 3. Encode and send Opus frames when we have enough samples
     while (opus_accumulator_pos >= 320) {
@@ -420,6 +536,14 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   }
   
   // Update statistics
+  // Log loop timing
+  uint64_t loop_duration = (esp_timer_get_time() - loop_start_time) / 1000;
+  static int timing_log_count = 0;
+  if (++timing_log_count <= 10 || timing_log_count % 20 == 0) {
+    ESP_LOGI(LOG_TAG, "[LOOP_TIME] call#%d: full loop took %llums (expect ~80ms for 5x16ms reads)", 
+             call_count, loop_duration);
+  }
+  
   cycle_count++;
   if (cycle_count % 50 == 0) {
     uint64_t avg_wait_time = total_wait_time / 50;
