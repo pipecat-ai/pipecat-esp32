@@ -25,28 +25,10 @@
 #define OPUS_ENCODER_BITRATE 30000
 #define OPUS_ENCODER_COMPLEXITY 0
 
-// Forward declare for use in set_is_playing
-static bool ref_buffer_primed = false;
-
-
+// AEC control
+static bool aec_enabled = true;  // Can be set to false to bypass AEC
 
 std::atomic<bool> is_playing = false;
-void set_is_playing(int16_t *in_buf, size_t in_samples) {
-  bool any_set = false;
-  for (size_t i = 0; i < in_samples; i++) {
-    if (in_buf[i] != -1 && in_buf[i] != 0 && in_buf[i] != 1) {
-      any_set = true;
-    }
-  }
-  bool was_playing = is_playing.load();
-  is_playing = any_set;
-  
-  // Reset buffer priming when playback stops
-  if (was_playing && !any_set) {
-    ref_buffer_primed = false;
-    ESP_LOGD(LOG_TAG, "Playback stopped, reset reference buffer priming");
-  }
-}
 
 esp_codec_dev_handle_t mic_codec_dev = NULL;
 esp_codec_dev_handle_t spk_codec_dev = NULL;
@@ -71,17 +53,33 @@ opus_int16 *decoder_buffer = NULL;
 OpusDecoder *opus_decoder = NULL;
 
 // Circular buffer for speaker reference data (not using FreeRTOS ring buffer)
-static int16_t* speaker_circular_buffer = NULL;
-static const size_t SPEAKER_BUFFER_SAMPLES = 4096;  // 4096 samples = 256ms @ 16kHz
-static const size_t MIN_REF_BUFFER_SAMPLES = 2560;  // 2 read cycles worth (160ms)
-static const size_t MIN_REF_BUFFER_RESUME = 1920;   // 1.5 cycles for recovery (120ms)
+// This is a sliding window buffer, not a queue - we read recent data for AEC
+static int16_t speaker_circular_buffer[640];   // Exactly 2 Opus frames (40ms @ 16kHz)
 static volatile size_t speaker_write_idx = 0;
 static volatile size_t speaker_read_idx = 0;
-static volatile size_t speaker_samples_available = 0;
+static volatile bool speaker_buffer_active = false; // True when we're receiving audio
 static portMUX_TYPE speaker_buffer_mutex = portMUX_INITIALIZER_UNLOCKED;
 
-// AEC reference delay compensation removed - assuming AEC implementation handles delay internally
-// ref_buffer_primed already declared above for use in set_is_playing
+// Function to update playback state and reset buffer when playback stops
+void set_is_playing(int16_t *in_buf, size_t in_samples) {
+  bool any_set = false;
+  for (size_t i = 0; i < in_samples; i++) {
+    if (in_buf[i] != -1 && in_buf[i] != 0 && in_buf[i] != 1) {
+      any_set = true;
+    }
+  }
+  bool was_playing = is_playing.load();
+  is_playing = any_set;
+  
+  // Reset buffer state when playback stops
+  if (was_playing && !any_set) {
+    portENTER_CRITICAL(&speaker_buffer_mutex);
+    speaker_buffer_active = false;
+    speaker_read_idx = speaker_write_idx; // Reset read to match write
+    portEXIT_CRITICAL(&speaker_buffer_mutex);
+    ESP_LOGD(LOG_TAG, "Playback stopped, reset speaker buffer");
+  }
+}
 
 void pipecat_init_audio_decoder() {
   int decoder_error = 0;
@@ -122,55 +120,30 @@ void pipecat_audio_decode(uint8_t *data, size_t size) {
     }
     
     // Also send to circular buffer for AEC reference
-    if (speaker_circular_buffer != NULL) {
-      // Variables for logging outside critical section
-      bool log_write = false;
-      bool log_overflow = false;
-      int write_count_log = 0;
-      int overflow_count_log = 0;
-      size_t samples_available_log = 0;
+    portENTER_CRITICAL(&speaker_buffer_mutex);
       
-      portENTER_CRITICAL(&speaker_buffer_mutex);
+      // Write to circular buffer, always keeping just the freshest 2 frames
+      for (int i = 0; i < decoded_size; i++) {
+        speaker_circular_buffer[speaker_write_idx] = decoder_buffer[i];
+        speaker_write_idx = (speaker_write_idx + 1) % 640;
+      }
+      speaker_buffer_active = true;
       
-      // Check if we have space
-      size_t space_available = SPEAKER_BUFFER_SAMPLES - speaker_samples_available;
-      if (space_available >= decoded_size) {
-        // Copy samples to circular buffer
-        for (int i = 0; i < decoded_size; i++) {
-          speaker_circular_buffer[speaker_write_idx] = decoder_buffer[i];
-          speaker_write_idx = (speaker_write_idx + 1) % SPEAKER_BUFFER_SAMPLES;
-        }
-        speaker_samples_available += decoded_size;
-        
-        // Prepare logging info
-        static int write_count = 0;
-        if (++write_count % 50 == 0) {
-          log_write = true;
-          write_count_log = write_count;
-          samples_available_log = speaker_samples_available;
-        }
-      } else {
-        // Buffer overflow
-        static int overflow_count = 0;
-        if (++overflow_count % 100 == 0) {
-          log_overflow = true;
-          overflow_count_log = overflow_count;
-        }
+      // If read pointer is too far behind, advance it to stay within 2 frames
+      size_t distance = (speaker_write_idx - speaker_read_idx + 640) % 640;
+      if (distance > 640 - 320) {
+        // Read pointer is about to be overrun, advance it
+        speaker_read_idx = (speaker_write_idx + 640 - 320) % 640;
       }
       
       portEXIT_CRITICAL(&speaker_buffer_mutex);
       
-      // Do logging outside critical section
-      if (log_write) {
-        ESP_LOGI(LOG_TAG, "Speaker buffer writes: %d, samples: %d, available: %d", 
-                 write_count_log, decoded_size, samples_available_log);
+      // Occasional logging
+      static int write_count = 0;
+      if (++write_count % 50 == 0) {
+        ESP_LOGI(LOG_TAG, "Speaker buffer: write_idx=%d, read_idx=%d", 
+                 speaker_write_idx, speaker_read_idx);
       }
-      if (log_overflow) {
-        ESP_LOGW(LOG_TAG, "Speaker buffer overflow count: %d", overflow_count_log);
-      }
-    } else {
-      ESP_LOGW(LOG_TAG, "Speaker circular buffer is NULL!");
-    }
   }
 }
 
@@ -183,7 +156,10 @@ static uint64_t total_read_time = 0;
 static uint64_t total_aec_time = 0;
 static uint64_t total_encode_time = 0;
 static uint64_t total_send_time = 0;
+static uint64_t total_wait_time = 0;
 static uint32_t cycle_count = 0;
+static uint32_t aec_skip_count = 0;
+static uint64_t last_frame_send_time = 0;
 
 // AEC processed buffer
 static int16_t *processed_buffer = NULL;
@@ -221,13 +197,8 @@ void pipecat_init_aec() {
   // Try a simpler approach - create AEC without the task configuration struct
   ESP_LOGI(LOG_TAG, "Initializing AEC");
   
-  // Create circular buffer for speaker reference data
-  speaker_circular_buffer = (int16_t *)heap_caps_malloc(SPEAKER_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-  if (speaker_circular_buffer == NULL) {
-    ESP_LOGE(LOG_TAG, "Failed to allocate speaker circular buffer");
-    return;
-  }
-  ESP_LOGI(LOG_TAG, "Speaker circular buffer created, size=%d samples", SPEAKER_BUFFER_SAMPLES);
+  // Speaker circular buffer is now statically allocated
+  ESP_LOGI(LOG_TAG, "Speaker circular buffer ready, size=640 samples");
   
   // Create AEC with basic parameters (filter_length=4 recommended for ESP32S3)
   aec_handle = afe_aec_create("MR", 4, AFE_TYPE_VC, AFE_MODE_LOW_COST);
@@ -270,278 +241,198 @@ void pipecat_init_aec() {
 void pipecat_send_audio(PeerConnection *peer_connection) {
   uint64_t start_time, end_time;
   
-  // Check if AEC is initialized
-  if (aec_handle == NULL) {
-    // AEC disabled, bypass processing
-    // ESP_LOGW(LOG_TAG, "AEC not initialized, bypassing");
+  // Wait for at least one Opus frame (320 samples) of speaker data
+  uint64_t wait_start = esp_timer_get_time();
+  while (true) {
+    portENTER_CRITICAL(&speaker_buffer_mutex);
+    int samples_available = 0;
+    if (speaker_buffer_active) {
+      samples_available = (speaker_write_idx - speaker_read_idx + 640) % 640;
+    }
+    portEXIT_CRITICAL(&speaker_buffer_mutex);
+    
+    if (samples_available >= 320) {
+      break;  // We have enough data
+    }
+    
+    // Brief delay before checking again
+    vTaskDelay(1 / portTICK_PERIOD_MS);
   }
+  uint64_t wait_end = esp_timer_get_time();
+  total_wait_time += (wait_end - wait_start);
   
-  // Measure esp_codec_dev_read time
-  start_time = esp_timer_get_time();
-  if (esp_codec_dev_read(mic_codec_dev, read_buffer, PCM_BUFFER_SIZE) !=
-      ESP_OK) {
-    printf("esp_codec_dev_read failed");
-    return;
-  }
-  end_time = esp_timer_get_time();
-  total_read_time += (end_time - start_time);
-
-  // Don't zero out microphone input - let AEC handle echo cancellation
-  // if (is_playing) {
-  //   memset(read_buffer, 0, PCM_BUFFER_SIZE);
-  // }
-
-  // AEC processing (skip if disabled)
-  if (aec_handle != NULL && aec_enabled) {
-    // Get AEC chunk size (should be 256 samples for 16kHz)
-    int aec_chunk_size = afe_aec_get_chunksize(aec_handle);
-    int total_samples = PCM_BUFFER_SIZE / sizeof(uint16_t);  // 640 samples
-    int num_chunks = total_samples / aec_chunk_size;  // Should be 2.5, so we'll process 2 chunks
-    
-    // Debug logging
-    static bool first_run = true;
-    if (first_run) {
-      ESP_LOGI(LOG_TAG, "AEC debug: chunk_size=%d, total_samples=%d, num_chunks=%d", 
-               aec_chunk_size, total_samples, num_chunks);
-      ESP_LOGI(LOG_TAG, "AEC debug: total_ch_num=%d, sample_rate=%d", 
-               aec_handle->pcm_config.total_ch_num, aec_handle->pcm_config.sample_rate);
-      ESP_LOGI(LOG_TAG, "AEC debug: input format=%s, mic_num=%d, ref_num=%d",
-               "MR", aec_handle->pcm_config.mic_num, aec_handle->pcm_config.ref_num);
-      first_run = false;
+  // Buffers for interleaved processing
+  static int16_t opus_accumulator[640];  // Accumulate AEC output for Opus encoding
+  static int opus_accumulator_pos = 0;
+  int16_t mic_chunk_buffer[256];
+  int aec_chunk_size = 256;  // AEC processes 256 samples at a time
+  
+  // Track timing for AEC skip decision
+  bool skip_last_aec = false;
+  int frame_count = 0;
+  
+  // Single loop processing 5 chunks of 256 samples each
+  for (int chunk = 0; chunk < 5; chunk++) {
+    // 1. Read 256 samples from microphone
+    start_time = esp_timer_get_time();
+    if (esp_codec_dev_read(mic_codec_dev, (uint8_t*)mic_chunk_buffer, 256 * sizeof(int16_t)) != ESP_OK) {
+      ESP_LOGE(LOG_TAG, "esp_codec_dev_read failed");
+      return;
     }
+    end_time = esp_timer_get_time();
+    total_read_time += (end_time - start_time);
     
-    // Process all chunks
-    if (num_chunks != AEC_CHUNKS_TO_BATCH) {
-      ESP_LOGW(LOG_TAG, "Unexpected number of AEC chunks: %d (expected %d)", num_chunks, AEC_CHUNKS_TO_BATCH);
-    }
-    
-    // Process AEC in chunks
-    for (int chunk = 0; chunk < num_chunks; chunk++) {
-      // Prepare input: interleave mic data with zeros (reference channel)
-      int16_t *mic_ptr = (int16_t *)read_buffer + (chunk * aec_chunk_size);
-      
+    // 2. Process with AEC or bypass
+    if (aec_handle != NULL && aec_enabled && !(chunk == 4 && skip_last_aec)) {
       // Get reference data from speaker circular buffer
-      bool have_ref_data = false;
-      int16_t ref_chunk[256];  // Temporary buffer for reference data
+      int16_t ref_chunk[256];
+      int samples_available = 0;
+      bool log_underrun = false;
+      static int underrun_count = 0;
+      static int ref_success_count = 0;
       
-      if (speaker_circular_buffer != NULL) {
-        // Variables for logging outside critical section
-        bool log_buffer_state = false;
-        bool log_primed = false;
-        bool log_underrun = false;
-        size_t samples_for_log = 0;
-        int underrun_type = 0;  // 0=none, 1=remaining chunks, 2=current chunk
-        size_t needed_for_log = 0;
+      portENTER_CRITICAL(&speaker_buffer_mutex);
         
-        portENTER_CRITICAL(&speaker_buffer_mutex);
-        
-        // Debug log buffer state occasionally
-        static int buffer_check_count = 0;
-        if (++buffer_check_count % 100 == 0) {
-          log_buffer_state = true;
-          samples_for_log = speaker_samples_available;
-        }
-        
-        // Warn if we're getting close to the unprime threshold
-        static int low_buffer_count = 0;
-        if (speaker_samples_available < 2200 && speaker_samples_available >= 1920) {
-          if (++low_buffer_count % 10 == 0) {
-            ESP_LOGW(LOG_TAG, "Buffer running low: %d samples (unprime at 1920)", speaker_samples_available);
-          }
-        } else {
-          low_buffer_count = 0;
-        }
-        
-        // Only start using reference data if we have enough buffered
-        // Use hysteresis to prevent oscillation
-        if (!ref_buffer_primed) {
-          size_t required_samples = in_recovery_mode ? MIN_REF_BUFFER_RESUME : MIN_REF_BUFFER_SAMPLES;
-          if (speaker_samples_available >= required_samples) {
-            ref_buffer_primed = true;
-            log_primed = true;
-            samples_for_log = speaker_samples_available;
-          }
-        }
-        
-        // Recovery check: if we've been unprimed for too long, reduce requirements
-        static int unprime_count = 0;
-        static bool in_recovery_mode = false;
-        
-        if (!ref_buffer_primed) {
-          unprime_count++;
-          // After 25 attempts (~2 seconds), enter recovery mode
-          if (unprime_count > 25 && !in_recovery_mode) {
-            in_recovery_mode = true;
-            ESP_LOGW(LOG_TAG, "Entering recovery mode after %d attempts", unprime_count);
-          }
-        } else {
-          unprime_count = 0;
-        }
-        
-        // Only try to get reference data if buffer is primed
-        if (ref_buffer_primed) {
-          // Check if we have enough samples for this chunk
-          if (speaker_samples_available >= aec_chunk_size) {
-            // Read samples from circular buffer
+        if (speaker_buffer_active) {
+          samples_available = (speaker_write_idx - speaker_read_idx + 640) % 640;
+          
+          if (samples_available >= aec_chunk_size) {
+            // We have enough data, read it
             for (int i = 0; i < aec_chunk_size; i++) {
               ref_chunk[i] = speaker_circular_buffer[speaker_read_idx];
-              speaker_read_idx = (speaker_read_idx + 1) % SPEAKER_BUFFER_SAMPLES;
+              speaker_read_idx = (speaker_read_idx + 1) % 640;
             }
-            speaker_samples_available -= aec_chunk_size;
-            have_ref_data = true;
+          } else if (samples_available > 0) {
+            // Not enough data, read what we have and pad with zeros
+            int i;
+            for (i = 0; i < samples_available; i++) {
+              ref_chunk[i] = speaker_circular_buffer[speaker_read_idx];
+              speaker_read_idx = (speaker_read_idx + 1) % 640;
+            }
+            for (; i < aec_chunk_size; i++) {
+              ref_chunk[i] = 0;
+            }
             
-            // Check if we're running too low for remaining chunks
-            int remaining_chunks = num_chunks - chunk - 1;
-            size_t remaining_samples_needed = remaining_chunks * aec_chunk_size;
-            
-            // In recovery mode, be more lenient - only unprime if we can't process ANY more chunks
-            if (in_recovery_mode) {
-              if (speaker_samples_available < aec_chunk_size) {
-                ref_buffer_primed = false;
-                log_underrun = true;
-                underrun_type = 1;
-                samples_for_log = speaker_samples_available;
-                needed_for_log = aec_chunk_size;
-              } else if (speaker_samples_available >= MIN_REF_BUFFER_SAMPLES) {
-                // Exit recovery mode once buffer is fully healthy
-                in_recovery_mode = false;
-                ESP_LOGI(LOG_TAG, "Exiting recovery mode, buffer healthy with %d samples", speaker_samples_available);
-              }
-            } else {
-              // Normal mode - only unprime if we drop below a lower threshold
-              // This provides hysteresis to prevent oscillation
-              if (speaker_samples_available < 1920) {  // 1.5 cycles = 120ms
-                ref_buffer_primed = false;
-                log_underrun = true;
-                underrun_type = 1;
-                samples_for_log = speaker_samples_available;
-                needed_for_log = remaining_samples_needed;
-                ESP_LOGW(LOG_TAG, "Unpriming: dropped below 1920 samples (have %d)", speaker_samples_available);
-              }
+            if (++underrun_count % 10 == 0) {
+              log_underrun = true;
             }
           } else {
-            // Not enough samples, unprime
-            ref_buffer_primed = false;
-            log_underrun = true;
-            underrun_type = 2;
-            samples_for_log = speaker_samples_available;
-            needed_for_log = aec_chunk_size;
+            // No data at all - don't advance read pointer, just use zeros
+            for (int i = 0; i < aec_chunk_size; i++) {
+              ref_chunk[i] = 0;
+            }
+            
+            if (++underrun_count % 10 == 0) {
+              log_underrun = true;
+            }
+          }
+        } else {
+          // Buffer not active, use zeros
+          for (int i = 0; i < aec_chunk_size; i++) {
+            ref_chunk[i] = 0;
           }
         }
         
         portEXIT_CRITICAL(&speaker_buffer_mutex);
         
-        // Do logging outside critical section
-        if (log_buffer_state) {
-          ESP_LOGI(LOG_TAG, "Circular buffer state: %d samples available, chunk %d/%d", 
-                   samples_for_log, chunk, num_chunks);
-        }
-        if (log_primed) {
-          ESP_LOGI(LOG_TAG, "Reference buffer primed with %d samples", samples_for_log);
-        }
         if (log_underrun) {
-          if (underrun_type == 1) {
-            ESP_LOGW(LOG_TAG, "Reference buffer underrun (chunk %d/%d, need %d samples for remaining, have %d)", 
-                     chunk, num_chunks, needed_for_log, samples_for_log);
-          } else {
-            ESP_LOGW(LOG_TAG, "Reference buffer underrun (chunk %d/%d, need %d samples for current, have %d)", 
-                     chunk, num_chunks, needed_for_log, samples_for_log);
-          }
+          ESP_LOGW(LOG_TAG, "Speaker buffer underrun: only %d/%d samples available", 
+                   samples_available, aec_chunk_size);
         }
-      } else {
-        static bool logged_null = false;
-        if (!logged_null) {
-          ESP_LOGW(LOG_TAG, "Speaker circular buffer is NULL during read!");
-          logged_null = true;
-        }
+      
+      // Create interleaved AEC input
+      for (int i = 0; i < aec_chunk_size; i++) {
+        aec_in_buffer[i * 2] = mic_chunk_buffer[i];     // Mic
+        aec_in_buffer[i * 2 + 1] = ref_chunk[i];        // Reference
       }
       
-      if (have_ref_data) {
-        // Use actual speaker reference data
-        for (int i = 0; i < aec_chunk_size; i++) {
-          aec_in_buffer[i * 2] = mic_ptr[i];      // Microphone channel
-          aec_in_buffer[i * 2 + 1] = ref_chunk[i]; // Reference channel (actual speaker data)
-        }
-        
-        // Log successful reads occasionally
-        static int ref_success_count = 0;
-        if (++ref_success_count % 50 == 0) {
-          ESP_LOGI(LOG_TAG, "Using speaker reference data, count: %d, buffer: %d samples", 
-                   ref_success_count, speaker_samples_available);
-        }
-      } else {
-        // No reference data available, use zeros
-        for (int i = 0; i < aec_chunk_size; i++) {
-          aec_in_buffer[i * 2] = mic_ptr[i];      // Microphone channel  
-          aec_in_buffer[i * 2 + 1] = 0;           // Reference channel (zeros as fallback)
-        }
-        // Log when we don't have reference data (only occasionally to avoid spam)
-        static int no_ref_count = 0;
-        if (++no_ref_count % 100 == 0) {
-          ESP_LOGW(LOG_TAG, "No speaker reference data available count: %d", no_ref_count);
-        }
-      }
-      
-      // Run AEC process for this chunk
+      // Run AEC
       start_time = esp_timer_get_time();
       int ret = afe_aec_process(aec_handle, aec_in_buffer, aec_out_buffer);
       end_time = esp_timer_get_time();
       total_aec_time += (end_time - start_time);
       
       if (ret < 0) {
-        ESP_LOGE(LOG_TAG, "afe_aec_process failed: return value %d (0x%x) at chunk %d", 
-                 ret, ret, chunk);
-        // Fall back to bypass on error
-        memcpy(processed_buffer, read_buffer, PCM_BUFFER_SIZE);
-        return;
-      }
-      // Log success on first chunk of first run
-      if (first_run && chunk == 0) {
-        ESP_LOGI(LOG_TAG, "AEC process successful, returned %d bytes", ret);
+        ESP_LOGE(LOG_TAG, "afe_aec_process failed: return value %d", ret);
+        // Fall back - copy mic input directly
+        memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
+      } else {
+        // Copy AEC output to accumulator
+        memcpy(opus_accumulator + opus_accumulator_pos, aec_out_buffer, 256 * sizeof(int16_t));
       }
       
-      // Copy AEC output to processed buffer
-      memcpy(processed_buffer + (chunk * aec_chunk_size), aec_out_buffer, aec_chunk_size * sizeof(int16_t));
+      // Log successful AEC processing occasionally
+      if (++ref_success_count % 50 == 0) {
+        ESP_LOGI(LOG_TAG, "Using speaker reference data, count: %d", ref_success_count);
+      }
+    } else {
+      // AEC disabled or skipped - copy mic input directly
+      memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
+      
+      if (chunk == 4 && skip_last_aec) {
+        static int skip_log_count = 0;
+        if (++skip_log_count % 10 == 0) {
+          ESP_LOGI(LOG_TAG, "Skipped AEC on 5th chunk to catch up, count: %d", skip_log_count);
+        }
+      }
     }
     
-    // All samples have been processed through AEC
-  } else {
-    // AEC disabled, just copy input to processed buffer
-    memcpy(processed_buffer, read_buffer, PCM_BUFFER_SIZE);
-  }
-
-  // Process Opus frames - we have exactly COMMON_BUFFER_SAMPLES (1280) samples
-  // This encodes to exactly OPUS_FRAMES_TO_BATCH (4) frames
-  for (int frame = 0; frame < OPUS_FRAMES_TO_BATCH; frame++) {
-    // Measure opus_encode time
-    start_time = esp_timer_get_time();
-    auto encoded_size = opus_encode(opus_encoder, 
-                                    processed_buffer + (frame * OPUS_FRAME_SIZE),
-                                    OPUS_FRAME_SIZE,
-                                    encoder_output_buffer, OPUS_BUFFER_SIZE);
-    end_time = esp_timer_get_time();
-    total_encode_time += (end_time - start_time);
+    opus_accumulator_pos += 256;
     
-    // Measure peer_connection_send_audio time
-    start_time = esp_timer_get_time();
-    peer_connection_send_audio(peer_connection, encoder_output_buffer,
-                               encoded_size);
-    end_time = esp_timer_get_time();
-    total_send_time += (end_time - start_time);
+    // 3. Encode and send Opus frames when we have enough samples
+    while (opus_accumulator_pos >= 320) {
+      start_time = esp_timer_get_time();
+      int encoded_size = opus_encode(opus_encoder, opus_accumulator, 320,
+                                    encoder_output_buffer, OPUS_BUFFER_SIZE);
+      end_time = esp_timer_get_time();
+      total_encode_time += (end_time - start_time);
+      
+      start_time = esp_timer_get_time();
+      peer_connection_send_audio(peer_connection, encoder_output_buffer, encoded_size);
+      end_time = esp_timer_get_time();
+      total_send_time += (end_time - start_time);
+      
+      frame_count++;
+      
+      // After sending the 3rd frame, check timing for next call
+      if (frame_count == 3) {
+        uint64_t third_frame_sent_time = end_time;
+        if (last_frame_send_time > 0) {
+          uint64_t elapsed = (third_frame_sent_time - last_frame_send_time) / 1000; // ms
+          if (elapsed > 62) {
+            skip_last_aec = true;
+            aec_skip_count++;
+          }
+        }
+      }
+      
+      // Remember when we sent the 4th frame
+      if (frame_count == 4) {
+        last_frame_send_time = end_time;
+      }
+      
+      // Shift remaining samples
+      opus_accumulator_pos -= 320;
+      if (opus_accumulator_pos > 0) {
+        memmove(opus_accumulator, opus_accumulator + 320, opus_accumulator_pos * sizeof(int16_t));
+      }
+    }
   }
   
-  // Update cycle count and print statistics every 50 cycles
+  // Update statistics
   cycle_count++;
   if (cycle_count % 50 == 0) {
+    uint64_t avg_wait_time = total_wait_time / 50;
     uint64_t avg_read_time = total_read_time / 50;
     uint64_t avg_aec_time = total_aec_time / 50;
     uint64_t avg_encode_time = total_encode_time / 50;
     uint64_t avg_send_time = total_send_time / 50;
     
-    ESP_LOGI(LOG_TAG, "Audio timing stats (avg over 50 cycles): read=%llu us, aec=%llu us, encode=%llu us, send=%llu us",
-             avg_read_time, avg_aec_time, avg_encode_time, avg_send_time);
+    ESP_LOGI(LOG_TAG, "Audio timing stats (avg over 50 cycles): wait=%llu us, read=%llu us, aec=%llu us, encode=%llu us, send=%llu us, aec_skips=%lu",
+             avg_wait_time, avg_read_time, avg_aec_time, avg_encode_time, avg_send_time, aec_skip_count);
     
-    // Reset counters for next 50 cycles
+    // Reset counters
+    total_wait_time = 0;
     total_read_time = 0;
     total_aec_time = 0;
     total_encode_time = 0;
