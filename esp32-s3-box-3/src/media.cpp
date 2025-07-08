@@ -213,8 +213,10 @@ void pipecat_init_aec() {
   // Speaker circular buffer is now statically allocated
   ESP_LOGI(LOG_TAG, "Speaker circular buffer ready, size=960 samples");
   
-  // Create AEC with basic parameters (filter_length=4 recommended for ESP32S3)
-  aec_handle = afe_aec_create("MR", 4, AFE_TYPE_VC, AFE_MODE_LOW_COST);
+  // Create AEC with basic parameters.
+  // Filter_length=4 recommended for ESP32S3, but filter_length=2 and AFE_MODE_LOW_COST seem to be a local
+  // maximum in terms of quality with the current code we have here.
+  aec_handle = afe_aec_create("MR", 2, AFE_TYPE_VC, AFE_MODE_LOW_COST);
   if (aec_handle == NULL) {
     ESP_LOGE(LOG_TAG, "Failed to create AEC");
     return;
