@@ -97,29 +97,7 @@ void pipecat_init_audio_decoder() {
 }
 
 void pipecat_audio_decode(uint8_t *data, size_t size) {
-  // Log packet arrival timing
-  static uint64_t last_decode_time = 0;
   uint64_t now = esp_timer_get_time();
-  if (last_decode_time > 0) {
-    uint64_t delta_ms = (now - last_decode_time) / 1000;
-    static int packet_count = 0;
-    packet_count++;
-    
-    // Log every packet for first 20, then every 10th
-    if (packet_count <= 20 || packet_count % 10 == 0) {
-      // Get current buffer state for correlation
-      size_t current_write_idx, current_read_idx, current_count;
-      portENTER_CRITICAL(&speaker_buffer_mutex);
-      current_write_idx = speaker_write_idx;
-      current_read_idx = speaker_read_idx;
-      current_count = speaker_buffer_count;
-      portEXIT_CRITICAL(&speaker_buffer_mutex);
-      
-      ESP_LOGI(LOG_TAG, "[ARRIVAL] pkt#%d: size=%d, delta=%llums, buffer=%d samples, w=%d r=%d", 
-               packet_count, size, delta_ms, current_count, current_write_idx, current_read_idx);
-    }
-  }
-  last_decode_time = now;
   
   // Decode Opus frame to get the size (or use fixed size if predictable)
   int decoded_size = opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
@@ -160,15 +138,6 @@ void pipecat_audio_decode(uint8_t *data, size_t size) {
         time_since_last_read = 0;  // First write or invalid timestamp
       }
       
-      // More frequent logging for debugging
-      static int write_count = 0;
-      write_count++;
-      if (write_count <= 20 || write_count % 10 == 0) {
-        // Log the actual count, not calculated value
-        ESP_LOGI(LOG_TAG, "[WRITE] cnt=%d: +%d samples, buffer=%d, since_read=%llums (w=%d r=%d)", 
-                 write_count, decoded_size, samples_in_buffer, time_since_last_read,
-                 speaker_write_idx, speaker_read_idx);
-      }
     
     // THEN: Process for playback
     set_is_playing(decoder_buffer, decoded_size);
@@ -287,16 +256,6 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   static uint64_t last_call_end_time = 0;
   uint64_t function_start_time = esp_timer_get_time();
   
-  // Log time since last call
-  if (last_call_end_time > 0) {
-    uint64_t time_between_calls = (function_start_time - last_call_end_time) / 1000;  // ms
-    static int between_calls_log_count = 0;
-    between_calls_log_count++;
-    if (between_calls_log_count <= 20 || between_calls_log_count % 10 == 0) {
-      ESP_LOGI(LOG_TAG, "[CALL_GAP] Time between calls: %llums (call #%d)", 
-               time_between_calls, between_calls_log_count);
-    }
-  }
   
   // Wait for (960 samples = 3 Opus frames) in our speaker data reference buffer to handle codec burst pattern
   uint64_t wait_start = esp_timer_get_time();
@@ -325,20 +284,6 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   uint64_t wait_end = esp_timer_get_time();
   total_wait_time += (wait_end - wait_start);
   
-  // Log initial buffer state
-  static int call_count = 0;
-  call_count++;
-  // Get consistent snapshot of buffer state
-  size_t log_write_idx, log_read_idx, log_count;
-  portENTER_CRITICAL(&speaker_buffer_mutex);
-  log_write_idx = speaker_write_idx;
-  log_read_idx = speaker_read_idx;
-  log_count = speaker_buffer_count;
-  portEXIT_CRITICAL(&speaker_buffer_mutex);
-  
-  ESP_LOGI(LOG_TAG, "[SEND_START] call#%d: initial=%d, wait=%lluus, iters=%d, count=%d, w=%d r=%d", 
-           call_count, initial_samples, wait_end - wait_start, wait_iterations,
-           log_count, log_write_idx, log_read_idx);
   
   // Buffers for interleaved processing
   static int16_t opus_accumulator[640];  // Accumulate AEC output for Opus encoding
@@ -357,18 +302,6 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   for (int chunk = 0; chunk < 5; chunk++) {
     uint64_t chunk_start_time = esp_timer_get_time();
     // 1. Read 256 samples from microphone
-    // Log buffer state before read (for chunk 0 and 1)
-    if (chunk <= 1) {
-      size_t pre_read_write_idx, pre_read_read_idx, pre_read_count;
-      portENTER_CRITICAL(&speaker_buffer_mutex);
-      pre_read_write_idx = speaker_write_idx;
-      pre_read_read_idx = speaker_read_idx;
-      pre_read_count = speaker_buffer_count;
-      portEXIT_CRITICAL(&speaker_buffer_mutex);
-      
-      ESP_LOGI(LOG_TAG, "[PRE_READ] chunk=%d: buffer has %d samples (w=%d r=%d)", 
-               chunk, pre_read_count, pre_read_write_idx, pre_read_read_idx);
-    }
     
     start_time = esp_timer_get_time();
     if (esp_codec_dev_read(mic_codec_dev, (uint8_t*)mic_chunk_buffer, 256 * sizeof(int16_t)) != ESP_OK) {
@@ -378,11 +311,6 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
     end_time = esp_timer_get_time();
     total_read_time += (end_time - start_time);
     
-    // Log if a long read happened (indicating actual blocking)
-    uint64_t read_duration = (end_time - start_time) / 1000;
-    if (read_duration > 10) {  // More than 10ms suggests actual blocking
-      ESP_LOGI(LOG_TAG, "[BLOCKED_READ] chunk=%d: read took %llums", chunk, read_duration);
-    }
     
     // 2. Process with AEC or bypass
     if (aec_handle != NULL && aec_enabled && !(chunk == 4 && skip_last_aec)) {
@@ -491,23 +419,10 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
       // DEBUG: Just copy mic data
       // memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
       
-      // Log successful reads more frequently for debugging
-      ref_success_count++;
-      if (ref_success_count <= 10 || ref_success_count % 20 == 0) {
-        uint64_t chunk_duration = (esp_timer_get_time() - chunk_start_time) / 1000;
-        ESP_LOGI(LOG_TAG, "[READ_OK] chunk=%d, got %d samples, chunk took %llums", 
-                 chunk, aec_chunk_size, chunk_duration);
-      }
     } else {
       // AEC disabled or skipped - copy mic input directly
       memcpy(opus_accumulator + opus_accumulator_pos, mic_chunk_buffer, 256 * sizeof(int16_t));
       
-      if (chunk == 4 && skip_last_aec) {
-        static int skip_log_count = 0;
-        if (++skip_log_count % 10 == 0) {
-          ESP_LOGI(LOG_TAG, "Skipped AEC on 5th chunk to catch up, count: %d", skip_log_count);
-        }
-      }
     }
     
     opus_accumulator_pos += 256;
@@ -544,38 +459,15 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
         float elapsed_seconds = elapsed_us / 1000000.0f;
         current_frame_rate = frames_sent / elapsed_seconds;
         
-        if (current_frame_rate < MIN_ACCEPTABLE_FRAME_RATE) {
-          ESP_LOGW(LOG_TAG, "Frame rate too low: %.1f fps (target: %.1f fps). Falling behind!", 
-                   current_frame_rate, TARGET_FRAME_RATE);
-          
-          // Set flag to skip AEC on next cycle
-          // (We'll use this instead of the old timing method)
+        if (current_frame_rate < MIN_ACCEPTABLE_FRAME_RATE) {          
+          // We could try to catch up here, somehow. But not sure what makes sense.
         }
         
         // Reset counters for next measurement period
         first_frame_time = now;
         frames_sent = 0;
       }
-      
-      // Old timing check - replaced by frame rate monitoring
-      // Keeping the structure in case we want to re-enable with new logic
-      /*
-      if (frame_count == 3) {
-        uint64_t third_frame_sent_time = end_time;
-        if (last_frame_send_time > 0) {
-          uint64_t elapsed = (third_frame_sent_time - last_frame_send_time) / 1000; // ms
-          if (elapsed > 62) {
-            skip_last_aec = true;
-            aec_skip_count++;
-          }
-        }
-      }
-      
-      if (frame_count == 4) {
-        last_frame_send_time = end_time;
-      }
-      */
-      
+            
       // Shift remaining samples
       opus_accumulator_pos -= 320;
       if (opus_accumulator_pos > 0) {
@@ -585,13 +477,6 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
   }
   
   // Update statistics
-  // Log loop timing
-  uint64_t loop_duration = (esp_timer_get_time() - loop_start_time) / 1000;
-  static int timing_log_count = 0;
-  if (++timing_log_count <= 10 || timing_log_count % 20 == 0) {
-    ESP_LOGI(LOG_TAG, "[LOOP_TIME] call#%d: full loop took %llums (expect ~80ms for 5x16ms reads)", 
-             call_count, loop_duration);
-  }
   
   cycle_count++;
   if (cycle_count % 50 == 0) {
@@ -612,6 +497,4 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
     total_send_time = 0;
   }
   
-  // Record end time for next call's gap measurement
-  last_call_end_time = esp_timer_get_time();
 }
