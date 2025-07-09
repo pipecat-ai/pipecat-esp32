@@ -1,11 +1,12 @@
-set(COMMON_SRC "main.cpp")
+set(COMMON_SRC "webrtc.cpp" "main.cpp" "http.cpp")
 
 if(IDF_TARGET STREQUAL linux)
 	idf_component_register(
-		SRCS ${COMMON_SRC})
+		SRCS ${COMMON_SRC}
+		REQUIRES peer esp-libopus esp_http_client json)
 else()
 	idf_component_register(
-		SRCS ${COMMON_SRC}
+		SRCS ${COMMON_SRC} "wifi.cpp" "media.cpp" "rtvi.cpp" "rtvi_callbacks.cpp"
 		REQUIRES driver esp_wifi nvs_flash peer esp_psram esp-libopus esp_http_client json)
 endif()
 
