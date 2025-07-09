@@ -6,12 +6,11 @@ This SDK has been developed and tested on a `esp32s3` and `linux`. You don't
 need any physical hardware to run this SDK, but it will be very limited
 (e.g. you won't hear an audio on Linux).
 
-To use it on hardware purchase either of these microcontrollers. Others may
+To use it on hardware purchase any of these microcontrollers. Others may
 work, but this is what has been developed against.
 
-* [Freenove ESP32-S3-WROOM](https://www.amazon.com/gp/product/B0BMQ8F7FN)
-* [Sonatino - ESP32-S3 Audio Development Board](https://www.amazon.com/gp/product/B0BVY8RJNP)
 * [Espressif - ESP32-S3-BOX-3](https://www.digikey.com/short/fb2vjrpn)
+* [M5Stack - CoreS3 ESP32S3 loT Development Kit](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit)
 
 ## 📋 Pre-requisites
 
