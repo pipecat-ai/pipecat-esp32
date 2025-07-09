@@ -4,6 +4,10 @@
 #include <cstring>
 #include <cstdio>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -18,6 +22,8 @@
 #define OPUS_ENCODER_COMPLEXITY 0
 
 std::atomic<bool> is_playing = false;
+unsigned int silence_count = 0;
+
 void set_is_playing(int16_t *in_buf, size_t in_samples) {
   bool any_set = false;
   for (size_t i = 0; i < in_samples; i++) {
@@ -25,26 +31,26 @@ void set_is_playing(int16_t *in_buf, size_t in_samples) {
       any_set = true;
     }
   }
-  is_playing = any_set;
+
+  if (any_set) {
+    silence_count = 0;
+  } else {
+    silence_count++;
+  }
+
+  if (silence_count >= 20 && is_playing) {
+    M5.Speaker.end();
+    M5.Mic.begin();
+    is_playing = false;
+  } else if (any_set && !is_playing) {
+    M5.Mic.end();
+    M5.Speaker.begin();
+    is_playing = true;
+  }
 }
 
-// esp_codec_dev_handle_t mic_codec_dev = NULL;
-// esp_codec_dev_handle_t spk_codec_dev = NULL;
-
 void pipecat_init_audio_capture() {
-  // mic_codec_dev = bsp_audio_codec_microphone_init();
-  // spk_codec_dev = bsp_audio_codec_speaker_init();
-
-  // esp_codec_dev_set_in_gain(mic_codec_dev, 42.0);
-  // esp_codec_dev_set_out_vol(spk_codec_dev, 255);
-
-  // esp_codec_dev_sample_info_t fs = {
-  //     .bits_per_sample = 16,
-  //     .channel = 1,
-  //     .sample_rate = SAMPLE_RATE,
-  // };
-  // esp_codec_dev_open(mic_codec_dev, &fs);
-  // esp_codec_dev_open(spk_codec_dev, &fs);
+  M5.Speaker.setVolume(255);
 }
 
 opus_int16 *decoder_buffer = NULL;
@@ -61,24 +67,37 @@ void pipecat_init_audio_decoder() {
   decoder_buffer = (opus_int16 *)malloc(PCM_BUFFER_SIZE);
 }
 
+void double_volume(int16_t *samples, size_t num_samples) {
+    for (size_t i = 0; i < num_samples; i++) {
+        int32_t amplified = (int32_t)samples[i] * 2;
+
+        // Clamp to 16-bit range
+        if (amplified > INT16_MAX) {
+            amplified = INT16_MAX;
+        } else if (amplified < INT16_MIN) {
+            amplified = INT16_MIN;
+        }
+
+        samples[i] = (int16_t)amplified;
+    }
+}
+
 void pipecat_audio_decode(uint8_t *data, size_t size) {
-  esp_err_t ret;
   int decoded_size =
       opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
 
   if (decoded_size > 0) {
     set_is_playing(decoder_buffer, decoded_size);
-    // if ((ret = esp_codec_dev_write(spk_codec_dev, decoder_buffer,
-    //                                decoded_size * sizeof(uint16_t))) !=
-    //     ESP_OK) {
-    //   ESP_LOGE(LOG_TAG, "esp_codec_dev_write failed: %s", esp_err_to_name(ret));
-    // }
+    if (is_playing) {
+      double_volume(decoder_buffer, decoded_size);
+      M5.Speaker.playRaw(decoder_buffer, decoded_size, SAMPLE_RATE);
+    }
   }
 }
 
 OpusEncoder *opus_encoder = NULL;
 uint8_t *encoder_output_buffer = NULL;
-uint8_t *read_buffer = NULL;
+int16_t *read_buffer = NULL;
 
 void pipecat_init_audio_encoder() {
   int encoder_error;
@@ -99,20 +118,16 @@ void pipecat_init_audio_encoder() {
   opus_encoder_ctl(opus_encoder, OPUS_SET_COMPLEXITY(OPUS_ENCODER_COMPLEXITY));
   opus_encoder_ctl(opus_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
 
-  read_buffer =
-      (uint8_t *)heap_caps_malloc(PCM_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
+  read_buffer = (int16_t *)heap_caps_malloc(PCM_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
   encoder_output_buffer = (uint8_t *)malloc(OPUS_BUFFER_SIZE);
 }
 
 void pipecat_send_audio(PeerConnection *peer_connection) {
-  // if (esp_codec_dev_read(mic_codec_dev, read_buffer, PCM_BUFFER_SIZE) !=
-  //     ESP_OK) {
-  //   printf("esp_codec_dev_read failed");
-  //   return;
-  // }
-
   if (is_playing) {
     memset(read_buffer, 0, PCM_BUFFER_SIZE);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  } else {
+    M5.Mic.record(read_buffer, PCM_BUFFER_SIZE / sizeof(uint16_t), SAMPLE_RATE);
   }
 
   auto encoded_size = opus_encode(opus_encoder, (const opus_int16 *)read_buffer,

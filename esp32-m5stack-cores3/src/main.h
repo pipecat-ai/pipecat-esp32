@@ -1,5 +1,9 @@
 #include <peer.h>
 
+#ifndef LINUX_BUILD
+#include <M5Unified.h>
+#endif
+
 #define LOG_TAG "pipecat"
 #define MAX_HTTP_OUTPUT_BUFFER 4096
 #define HTTP_TIMEOUT_MS 10000
