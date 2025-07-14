@@ -18,6 +18,7 @@
 
 #include "driver/i2c_master.h"
 #include <driver/i2s_std.h>
+#include "freertos/ringbuf.h"
 
 #include "main.h"
 
@@ -25,6 +26,7 @@
 
 #define OPUS_BUFFER_SIZE 1276  // 1276 bytes is recommended by opus_encode
 #define PCM_BUFFER_SIZE 640
+#define PLAY_BUFFER_SIZE 50
 
 #define OPUS_ENCODER_BITRATE 30000
 #define OPUS_ENCODER_COMPLEXITY 0
@@ -148,13 +150,8 @@ void configure_es8311(void) {
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(audio_dev, 100));
 }
 
-int Read(void* dest, int size) {
+int record_audio(void* dest, int size) {
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(audio_dev, (void*)dest, size));
-    return size;
-}
-
-int Write(const void* data, int size) {
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(audio_dev, (void*)data, size));
     return size;
 }
 
@@ -177,7 +174,41 @@ void pipecat_init_audio_capture() {
 }
 
 opus_int16 *decoder_buffer = NULL;
+RingbufHandle_t decoder_buffer_queue;
+std::atomic<int> play_task_buffer_idx = 0;
+
+int play_audio(const void* data, int size) {
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(audio_dev, (void*)data, size));
+    return size;
+}
+
+static void play_task(void *arg) {
+  size_t len;
+  uint8_t *play_task_buffer[PLAY_BUFFER_SIZE + 1] = {0};
+
+  while (1) {
+      auto audio_buffer = (uint8_t *) xRingbufferReceive(decoder_buffer_queue, &len, portMAX_DELAY);
+      play_task_buffer_idx++;
+
+      if (play_task_buffer_idx < PLAY_BUFFER_SIZE) {
+          play_task_buffer[play_task_buffer_idx] = audio_buffer;
+          continue;
+      }
+
+      if (play_task_buffer_idx == PLAY_BUFFER_SIZE) {
+          for (auto i = 1; i < PLAY_BUFFER_SIZE; i++) {
+              play_audio(play_task_buffer[i], PCM_BUFFER_SIZE);
+              vRingbufferReturnItem(decoder_buffer_queue, play_task_buffer[i]);
+          }
+      }
+
+      play_audio(audio_buffer, PCM_BUFFER_SIZE);
+      vRingbufferReturnItem(decoder_buffer_queue, audio_buffer);
+  }
+}
+
 OpusDecoder *opus_decoder = NULL;
+StaticRingbuffer_t rb_struct;
 
 void pipecat_init_audio_decoder() {
   int decoder_error = 0;
@@ -188,10 +219,15 @@ void pipecat_init_audio_decoder() {
   }
 
   decoder_buffer = (opus_int16 *)malloc(PCM_BUFFER_SIZE);
+
+  auto ring_buffer_size = PCM_BUFFER_SIZE * (PLAY_BUFFER_SIZE) + (PLAY_BUFFER_SIZE * 10);
+  decoder_buffer_queue = xRingbufferCreateStatic(ring_buffer_size, RINGBUF_TYPE_NOSPLIT, (uint8_t *) malloc(ring_buffer_size), &rb_struct);
+  xTaskCreate(play_task, "play_task", 4096, NULL, 5, NULL);
 }
 
 
 std::atomic<bool> is_playing = false;
+
 unsigned int silence_count = 0;
 
 void set_is_playing(int16_t *in_buf, size_t in_samples) {
@@ -210,18 +246,22 @@ void set_is_playing(int16_t *in_buf, size_t in_samples) {
 
   if (silence_count >= 20 && is_playing) {
     is_playing = false;
+    play_task_buffer_idx = 0;
   } else if (any_set && !is_playing) {
     is_playing = true;
   }
 }
 
-
 void pipecat_audio_decode(uint8_t *data, size_t size) {
-  int decoded_size =
-      opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
+  int decoded_size = opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
 
   if (decoded_size > 0) {
-    Write(decoder_buffer, PCM_BUFFER_SIZE);
+    set_is_playing(decoder_buffer, decoded_size);
+    if (!is_playing) {
+      return;
+    }
+
+    xRingbufferSend(decoder_buffer_queue, decoder_buffer, PCM_BUFFER_SIZE, 0);
   }
 }
 
@@ -257,7 +297,7 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
     memset(read_buffer, 0, PCM_BUFFER_SIZE);
     vTaskDelay(pdMS_TO_TICKS(20));
   } else {
-    // Do record
+    record_audio(read_buffer, PCM_BUFFER_SIZE);
   }
 
   auto encoded_size = opus_encode(opus_encoder, (const opus_int16 *)read_buffer,
