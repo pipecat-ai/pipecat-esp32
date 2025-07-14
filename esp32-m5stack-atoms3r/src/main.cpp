@@ -16,15 +16,6 @@ extern "C" void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
-  auto cfg = M5.config();
-  cfg.external_speaker.atomic_echo = true;
-  M5.begin(cfg);
-
-  M5.Display.setBrightness(70);
-  M5.Display.setTextSize(1.5);
-  M5.Display.fillScreen(BLACK);
-  M5.Display.println("Pipecat ESP32 client initialized\n");
-
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   peer_init();
   pipecat_init_audio_capture();
