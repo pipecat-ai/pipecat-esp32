@@ -77,6 +77,7 @@ static void screen_task(void *pvParameter) {
 }
 
 void pipecat_init_screen() {
+
   bsp_display_start();
 
   bsp_display_backlight_on();
