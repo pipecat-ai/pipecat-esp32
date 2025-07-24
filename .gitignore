@@ -2,3 +2,6 @@ build
 sdkconfig
 sdkconfig.old
 managed_components
+.cache
+.vscode
+*_configuration.json
