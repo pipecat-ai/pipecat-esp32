@@ -15,6 +15,9 @@
 #define OPUS_ENCODER_BITRATE 30000
 #define OPUS_ENCODER_COMPLEXITY 0
 
+// #define HALF_DUPLEX // mute mic when bot speaking
+
+#ifdef HALF_DUPLEX
 std::atomic<bool> is_playing = false;
 void set_is_playing(int16_t *in_buf, size_t in_samples) {
   bool any_set = false;
@@ -25,6 +28,7 @@ void set_is_playing(int16_t *in_buf, size_t in_samples) {
   }
   is_playing = any_set;
 }
+#endif
 
 esp_codec_dev_handle_t mic_codec_dev = NULL;
 esp_codec_dev_handle_t spk_codec_dev = NULL;
@@ -65,7 +69,9 @@ void pipecat_audio_decode(uint8_t *data, size_t size) {
       opus_decode(opus_decoder, data, size, decoder_buffer, PCM_BUFFER_SIZE, 0);
 
   if (decoded_size > 0) {
+    #ifdef HALF_DUPLEX
     set_is_playing(decoder_buffer, decoded_size);
+    #endif
     if ((ret = esp_codec_dev_write(spk_codec_dev, decoder_buffer,
                                    decoded_size * sizeof(uint16_t))) !=
         ESP_OK) {
@@ -109,9 +115,11 @@ void pipecat_send_audio(PeerConnection *peer_connection) {
     return;
   }
 
+  #ifdef HALF_DUPLEX
   if (is_playing) {
     memset(read_buffer, 0, PCM_BUFFER_SIZE);
   }
+  #endif
 
   auto encoded_size = opus_encode(opus_encoder, (const opus_int16 *)read_buffer,
                                   PCM_BUFFER_SIZE / sizeof(uint16_t),
