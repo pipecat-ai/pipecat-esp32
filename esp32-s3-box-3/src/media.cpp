@@ -15,7 +15,7 @@
 #define OPUS_ENCODER_BITRATE 30000
 #define OPUS_ENCODER_COMPLEXITY 0
 
-// #define HALF_DUPLEX // mute mic when bot speaking
+#define HALF_DUPLEX // mute mic when bot speaking
 
 #ifdef HALF_DUPLEX
 std::atomic<bool> is_playing = false;
