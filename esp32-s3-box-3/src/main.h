@@ -1,4 +1,5 @@
 #include <peer.h>
+#include <cJSON.h>
 
 #define LOG_TAG "pipecat"
 #define MAX_HTTP_OUTPUT_BUFFER 4096
@@ -18,7 +19,8 @@ extern void pipecat_audio_decode(uint8_t *data, size_t size);
 // WebRTC / Signalling
 extern void pipecat_init_webrtc();
 extern void pipecat_webrtc_loop();
-extern void pipecat_http_request(char *offer, char *answer);
+extern cJSON* pipecat_cloud_start_agent();
+extern void pipecat_http_request(char *session_id, char *offer, char *answer);
 
 // RTVI
 typedef struct {

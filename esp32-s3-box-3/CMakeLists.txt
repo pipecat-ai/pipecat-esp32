@@ -9,15 +9,16 @@ if(NOT IDF_TARGET STREQUAL linux)
   add_compile_definitions(WIFI_PASSWORD="$ENV{WIFI_PASSWORD}")
 endif()
 
-if(NOT DEFINED ENV{PIPECAT_SMALLWEBRTC_URL})
-  message(FATAL_ERROR "Env variable PIPECAT_SMALLWEBRTC_URL must be set")
+if(NOT DEFINED ENV{PCC_AGENT_URL})
+  message(FATAL_ERROR "Env variable PCC_AGENT_URL must be set")
 endif()
 
 if(DEFINED ENV{LOG_DATACHANNEL_MESSAGES})
   add_compile_definitions(LOG_DATACHANNEL_MESSAGES="1")
 endif()
 
-add_compile_definitions(PIPECAT_SMALLWEBRTC_URL="$ENV{PIPECAT_SMALLWEBRTC_URL}")
+add_compile_definitions(PCC_AGENT_URL="$ENV{PCC_AGENT_URL}")
+add_compile_definitions(PCC_PUBLIC_API_KEY="$ENV{PCC_PUBLIC_API_KEY}")
 
 set(COMPONENTS src)
 set(EXTRA_COMPONENT_DIRS "src" "components/srtp" "components/peer" "components/esp-libopus")

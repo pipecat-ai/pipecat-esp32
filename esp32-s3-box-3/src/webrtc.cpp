@@ -3,6 +3,7 @@
 #include <opus.h>
 #endif
 
+#include <cJSON.h>
 #include <esp_event.h>
 #include <esp_log.h>
 #include <string.h>
@@ -28,7 +29,7 @@ static void pipecat_ondatachannel_onmessage_task(char *msg, size_t len,
 #ifdef LOG_DATACHANNEL_MESSAGES
   ESP_LOGI(LOG_TAG, "DataChannel Message: %s", msg);
 #endif
-  pipecat_rtvi_handle_message(msg);
+  //  pipecat_rtvi_handle_message(msg);
 }
 
 static void pipecat_ondatachannel_onopen_task(void *userdata) {
@@ -64,17 +65,35 @@ static void pipecat_onconnectionstatechange_task(PeerConnectionState state,
 }
 
 static void pipecat_on_icecandidate_task(char *description, void *user_data) {
+  cJSON *j_response = pipecat_cloud_start_agent();
+  if (j_response == NULL) {
+    ESP_LOGE(LOG_TAG, "Unable to get response from start agent");
+#ifndef LINUX_BUILD
+    esp_restart();
+#endif
+  }
+
+  cJSON *j_session_id = cJSON_GetObjectItem(j_response, "sessionId");
+  if (j_session_id == NULL) {
+    ESP_LOGE(LOG_TAG, "Unable to find `sessionId` field in response");
+#ifndef LINUX_BUILD
+    esp_restart();
+#endif
+  }
+
   char *local_buffer = (char *)malloc(MAX_HTTP_OUTPUT_BUFFER + 1);
   memset(local_buffer, 0, MAX_HTTP_OUTPUT_BUFFER + 1);
-  pipecat_http_request(description, local_buffer);
-  peer_connection_set_remote_description(peer_connection, local_buffer,
-                                         SDP_TYPE_ANSWER);
+  pipecat_http_request(j_session_id->valuestring, description, local_buffer);
+
+  peer_connection_set_remote_description(peer_connection, local_buffer, SDP_TYPE_ANSWER);
   free(local_buffer);
 }
 
 void pipecat_init_webrtc() {
   PeerConfiguration peer_connection_config = {
-      .ice_servers = {},
+      .ice_servers = {
+        { .urls = "stun:stun.l.google.com:19302", .username = NULL, .credential = NULL },
+      },
       .audio_codec = CODEC_OPUS,
       .video_codec = CODEC_NONE,
       .datachannel = DATA_CHANNEL_STRING,

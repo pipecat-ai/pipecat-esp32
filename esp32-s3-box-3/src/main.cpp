@@ -35,7 +35,7 @@ extern "C" void app_main(void) {
 int main(void) {
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   peer_init();
-  pipecat_webrtc();
+  pipecat_init_webrtc();
 
   while (1) {
     pipecat_webrtc_loop();
