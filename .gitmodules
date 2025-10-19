@@ -10,3 +10,6 @@
 [submodule "esp32-s3-box-3/components/esp-protocols"]
 	path = esp32-s3-box-3/components/esp-protocols
 	url = https://github.com/espressif/esp-protocols.git
+[submodule "esp32-s3-box-3/esp-adf"]
+	path = esp32-s3-box-3/esp-adf
+	url = https://github.com/espressif/esp-adf.git

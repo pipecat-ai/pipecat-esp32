@@ -5,20 +5,26 @@
 
 #include <esp_event.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <string.h>
 
 #include "main.h"
 
+extern SemaphoreHandle_t webrtcSemaphore;
+
 static PeerConnection *peer_connection = NULL;
 
 #ifndef LINUX_BUILD
-StaticTask_t task_buffer;
+
+static TaskHandle_t xPcTaskHandle = NULL;
+static TaskHandle_t xSendAudioTaskHandle = NULL;
+
 void pipecat_send_audio_task(void *user_data) {
   pipecat_init_audio_encoder();
 
   while (1) {
     pipecat_send_audio(peer_connection);
-    vTaskDelay(pdMS_TO_TICKS(TICK_INTERVAL));
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 #endif
@@ -51,13 +57,15 @@ static void pipecat_onconnectionstatechange_task(PeerConnectionState state,
 #ifndef LINUX_BUILD
     esp_restart();
 #endif
-  } else if (state == PEER_CONNECTION_CONNECTED) {
+  } else if (state == PEER_CONNECTION_COMPLETED) {
 #ifndef LINUX_BUILD
-    StackType_t *stack_memory = (StackType_t *)heap_caps_malloc(
-        30000 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    xTaskCreateStaticPinnedToCore(pipecat_send_audio_task, "audio_publisher",
-                                  30000, NULL, 7, stack_memory, &task_buffer,
-                                  0);
+
+    ESP_LOGI(LOG_TAG, "Creating send audio task");
+    // Todo: move this to a separate init block
+    // Why is this stack size so large? Opus encoder?
+    xTaskCreatePinnedToCore(pipecat_send_audio_task, "audio_publisher", 24576, NULL, 7, &xSendAudioTaskHandle, 1);
+    heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+
     pipecat_init_rtvi(peer_connection, &pipecat_rtvi_callbacks);
 #endif
   }
@@ -108,4 +116,30 @@ void pipecat_init_webrtc() {
 
 void pipecat_webrtc_loop() {
   peer_connection_loop(peer_connection);
+}
+
+
+void peer_connection_task(void* arg) {
+  ESP_LOGI(LOG_TAG, "peer_connection_task started");
+
+  while (peer_connection == NULL) {
+    ESP_LOGI(LOG_TAG, "peer_connection_task waiting for peer_connection");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+
+  for (;;) {
+    if (xSemaphoreTake(webrtcSemaphore, portMAX_DELAY)) {
+      peer_connection_loop(peer_connection);
+      xSemaphoreGive(webrtcSemaphore);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+void pipecat_webrtc_run_task() {
+  ESP_LOGI(LOG_TAG, "peer_connection_task starting ...");
+
+  xTaskCreatePinnedToCore(peer_connection_task, "peer_connection", 16384, NULL, 5, &xPcTaskHandle, 0);
 }
