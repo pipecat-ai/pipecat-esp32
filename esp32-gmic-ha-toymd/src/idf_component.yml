@@ -1,0 +1,5 @@
+dependencies:
+  idf:
+    version: ">=5.4"
+  espressif/es8311: "*"
+  espressif/esp_codec_dev: "~1.4"
