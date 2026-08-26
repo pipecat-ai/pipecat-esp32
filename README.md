@@ -12,6 +12,19 @@ work, but this is what has been developed against.
 * [Espressif - ESP32-S3-BOX-3](https://www.digikey.com/short/fb2vjrpn)
 * [M5Stack - CoreS3 ESP32S3 loT Development Kit](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit)
 
+### Custom boards without an `esp-bsp` package
+
+The directories above target dev kits, which come with an `esp-bsp` or
+`M5Unified` package that knows the board's audio wiring. Most boards you would
+actually ship a product on do not have one.
+
+`esp32-gmic-ha-toymd` is a worked example of a plain ESP32-S3 + ES8311 module -
+one codec doing both capture and playback, no screen, no PMIC, no BSP. The only
+board-specific file is `src/board.c`, which brings up I2C, I2S and the codec
+directly against the ESP-IDF and `esp_codec_dev` APIs. To support a different
+custom board, copy that directory and change the pin defines and the codec
+model; nothing else in the client changes.
+
 ## 📋 Pre-requisites
 
 Clone this repository:
@@ -43,7 +56,7 @@ Pipecat bot.
 
 ## 🛠️ Build
 
-Go inside the `esp32-s3-box-3` directory.
+Go inside the directory for your board (e.g. `esp32-s3-box-3`).
 
 The first thing to do is to set the desired target, for example:
 
